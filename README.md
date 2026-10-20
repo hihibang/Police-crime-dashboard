@@ -105,7 +105,7 @@
 
 ## 4. 사이트 설명 및 서비스 안내
 
-![경찰청 범죄 통계 대시보드 웹사이트](./images/dashboard_preview.png)
+![경찰청 범죄 통계 대시보드 웹사이트](./images/index.png)
 
 ### 🌐 사이트 정보
 - **웹사이트 주소**: [https://hihibang.github.io/Police-crime-dashboard/](https://hihibang.github.io/Police-crime-dashboard/)
