@@ -85,7 +85,7 @@
 </head>
 
 <body class="min-h-screen p-4">
-  <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3">
+  <div class="flex w-full flex-col gap-3">
 
     <!-- 헤더 -->
     <header class="flex flex-wrap items-center justify-between gap-3">
@@ -99,7 +99,7 @@
           class="min-w-[260px] rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"></select>
         <button id="downloadBtn" type="button"
           class="rounded-lg border border-cyan-500/60 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-300 transition hover:bg-cyan-500/20">
-          📥 원본 데이터 세트 전체 다운로드 (3개 파일)
+          📦 원본 데이터 ZIP 다운로드 (3개 파일)
         </button>
       </div>
     </header>
@@ -173,6 +173,7 @@
       'data/경찰청_범죄 발생 장소별 통계_20251231.csv',
       'data/경찰청_범죄 발생 지역별 통계_20241231.csv'
     ];
+    const ZIP_FILE_NAME = '경찰청_범죄통계_원본데이터.zip';
     const COLORS = { time: '#22d3ee', place: '#34d399', region: '#fbbf24', grid: '#1e293b', tick: '#94a3b8' };
 
     /* ===================== 유틸 ===================== */
@@ -459,17 +460,119 @@
     }
 
     /* ===================== 원본 데이터 일괄 다운로드 ===================== */
-    function downloadAll() {
-      DOWNLOAD_FILES.forEach((path, i) => {
-        setTimeout(() => {
-          const a = document.createElement('a');
-          a.href = encodeURI(path);
-          a.download = path.split('/').pop();
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-        }, i * 300);
-      });
+    /* 원본 CSV는 CP949(EUC-KR) 인코딩이라 그대로 내려받으면 한글이 깨짐.
+       CP949로 디코딩 후 UTF-8(BOM 포함)로 다시 저장해 어떤 환경에서도 한글이 보이도록 함 */
+    async function downloadCsvAsUtf8(path) {
+      const res = await fetch(encodeURI(path));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = new TextDecoder('euc-kr').decode(await res.arrayBuffer());
+      return new Blob(['﻿', text], { type: 'text/csv;charset=utf-8' });
+    }
+
+    function saveBlob(blob, name) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    /* 외부 라이브러리 없이 ZIP(무압축 STORE) 생성. 파일명은 UTF-8 플래그(0x0800)로 저장 */
+    const CRC_TABLE = (() => {
+      const t = new Uint32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        t[n] = c >>> 0;
+      }
+      return t;
+    })();
+
+    function crc32(bytes) {
+      let c = 0xFFFFFFFF;
+      for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xFF] ^ (c >>> 8);
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    function buildZip(entries) {
+      const enc = new TextEncoder();
+      const now = new Date();
+      const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+      const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+      const parts = [];
+      const central = [];
+      let offset = 0;
+
+      for (const { name, data } of entries) {
+        const nameBytes = enc.encode(name);
+        const crc = crc32(data);
+
+        const lh = new DataView(new ArrayBuffer(30));
+        lh.setUint32(0, 0x04034b50, true);   // local file header 시그니처
+        lh.setUint16(4, 20, true);           // 필요 버전
+        lh.setUint16(6, 0x0800, true);       // 범용 플래그: UTF-8 파일명
+        lh.setUint16(10, dosTime, true);
+        lh.setUint16(12, dosDate, true);
+        lh.setUint32(14, crc, true);
+        lh.setUint32(18, data.length, true); // 압축 크기 (STORE)
+        lh.setUint32(22, data.length, true); // 원본 크기
+        lh.setUint16(26, nameBytes.length, true);
+        parts.push(new Uint8Array(lh.buffer), nameBytes, data);
+
+        const ch = new DataView(new ArrayBuffer(46));
+        ch.setUint32(0, 0x02014b50, true);   // central directory 시그니처
+        ch.setUint16(4, 20, true);
+        ch.setUint16(6, 20, true);
+        ch.setUint16(8, 0x0800, true);
+        ch.setUint16(12, dosTime, true);
+        ch.setUint16(14, dosDate, true);
+        ch.setUint32(16, crc, true);
+        ch.setUint32(20, data.length, true);
+        ch.setUint32(24, data.length, true);
+        ch.setUint16(28, nameBytes.length, true);
+        ch.setUint32(42, offset, true);      // 로컬 헤더 위치
+        central.push(new Uint8Array(ch.buffer), nameBytes);
+
+        offset += 30 + nameBytes.length + data.length;
+      }
+
+      const cdSize = central.reduce((sum, p) => sum + p.length, 0);
+      const eocd = new DataView(new ArrayBuffer(22));
+      eocd.setUint32(0, 0x06054b50, true); // end of central directory 시그니처
+      eocd.setUint16(8, entries.length, true);
+      eocd.setUint16(10, entries.length, true);
+      eocd.setUint32(12, cdSize, true);
+      eocd.setUint32(16, offset, true);
+
+      return new Blob([...parts, ...central, new Uint8Array(eocd.buffer)], { type: 'application/zip' });
+    }
+
+    async function downloadAll() {
+      try {
+        const entries = [];
+        for (const path of DOWNLOAD_FILES) {
+          const blob = await downloadCsvAsUtf8(path);
+          entries.push({ name: path.split('/').pop(), data: new Uint8Array(await blob.arrayBuffer()) });
+        }
+        saveBlob(buildZip(entries), ZIP_FILE_NAME);
+      } catch (err) {
+        // fetch 실패(file:// 등) 시 ZIP 생성 불가 → 안내 후 개별 원본 파일 링크로 대체
+        console.warn('ZIP 생성 실패, 개별 다운로드로 대체:', err);
+        alert('ZIP 생성에 실패해 개별 파일로 다운로드합니다.\n(웹 서버 주소(http://)로 열어야 ZIP 다운로드가 가능합니다.)');
+        DOWNLOAD_FILES.forEach((path, i) => {
+          setTimeout(() => {
+            const a = document.createElement('a');
+            a.href = encodeURI(path);
+            a.download = path.split('/').pop();
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          }, i * 300);
+        });
+      }
     }
 
     /* ===================== 초기화 ===================== */
